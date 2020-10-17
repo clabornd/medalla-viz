@@ -1,0 +1,282 @@
+---
+title: "Visualizations of Medalla Slashing Activity"
+output: html_document
+bibliography: citations.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warnings = FALSE)
+library(reticulate)
+use_python("/home/daniel/anaconda3/envs/medalla-viz/bin/")
+```
+
+This document was made using Rmarkdown [@rmarkdown] and Reticulate [@reticulate] as an interface to python.  All plots made using Plotly [@plotly].  The data used in these visualizations was provided by [Jim McDonald](https://github.com/mcdee) using the chaind tool:  https://github.com/wealdtech/chaind.  Please go to the [medalla-data-challenge channel](https://discord.com/channels/694822223575384095/752638638189445220) of the ethstaker discord to find links to various sized .dmp files and instructions to load them into a psql database.  My understanding of the data comes mostly from the Ethstaker discord and [this](https://ethos.dev/beacon-chain/) blog post.
+
+#### Load libraries and data
+
+The data lives in a psql database, and is accessed using pyspark, which I only use for learning purposes and in anticipation of needing it for larger data.  I specify two objects, one to load an entire table, and another to query parts of a table.  The second is not used, but I include it for completeness.
+
+```{python, echo = TRUE}
+from plotly import graph_objects as go
+import pandas as pd
+import numpy as np
+import plotly.io as pio
+
+from pyspark import SparkContext, SparkConf, SQLContext
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+import pyspark.sql.functions as F
+
+spark = (
+    SparkSession.builder
+    .appName("chain")
+    .master("local[4]")
+    .config("spark.driver.memory", '8G')
+    .config("spark.driver.maxResultsSize", "2G") 
+    .config("spark.kryoserializer.buffer.max", "500m")
+    .config("spark.jars", "/mnt/sda5/java_jars/postgresql-42.2.16.jar") 
+    .getOrCreate()
+)
+```
+
+```{python, echo = TRUE}
+dbname = "chain-388705"
+with open('/mnt/sda5/git_repos/medalla-viz/.user-chain-cred.txt', 'r') as f:
+    password = f.readline().rstrip("\n")
+
+# To load a whole table
+dbloader = spark.read \
+.format("jdbc") \
+.option("url", "jdbc:postgresql://127.0.0.1:5432/{}".format(dbname)) \
+.option("user", "chain") \
+.option("password", password) \
+.option("driver", "org.postgresql.Driver")
+
+# If we need to query parts of large tables (t_attestations is the only real offender)
+dbquery = spark.read \
+.format("jdbc") \
+.option("url", "jdbc:postgresql://127.0.0.1:5432/{}".format(dbname)) \
+.option("user", "chain") \
+.option("password", password) \
+.option("driver", "org.postgresql.Driver")
+```
+
+The two tables we will look at are t_blocks and t_attester_slashings, which contain information about blocks and slashing offenses as a result of bad attestations (I do not include proposer slashings, as there are very few examples in the database).  The two types of slashable offences contained in the data are surround votes and double votes as described in the ["Slashable Offences" section](https://ethos.dev/beacon-chain/#slashable-offences) of the above mentioned article.  It will probably be useful to review the section on [beacon chain checkpoints](https://ethos.dev/beacon-chain/#beacon-chain-checkpoints)
+
+```{python}
+blocks = dbloader.option("dbtable", "t_blocks").load()
+attSlashings = dbloader.option("dbtable", "t_attester_slashings").load()
+
+blocks.columns
+attSlashings.columns
+```
+
+Taking a look at the columns...
+
+```{python}
+print("blocks columns:  "+", ".join(blocks.columns))
+print("slashings columns:  "+", ".join(attSlashings.columns))
+```
+...we can see we have information about the slot number and hash of the block root in the blocks table.  The slashings table has information about pairs of attestations that resulted in a slashing, tagged as attestation_1 and attestation_2.  In each row, we will find validator ids (f_attestation_(1/2)_indices) that made these attestations, there will be at least one that did both, resulting in a slashable offense.
+
+### Table munging
+
+I want a table with the slot # for the source and targets for each pair of attestations, so I perform several joins to append the slot # information, as well as compute the intersect of the columns containing the validator ids to get the slashed validators:
+
+```{python}
+slashings_blocks = (
+    attSlashings
+        # Get the slot # for the source of first attestation ...
+        .join(
+            blocks.select(F.col("f_root").alias("f_attestation_1_source_root"),
+                          F.col("f_slot").alias("src_1_slot"), 
+                          F.col("f_parent_root").alias("src_1_parent_root")
+                         ), 
+            on = "f_attestation_1_source_root"
+        )
+        # ... slot # for the target of first attestation ...
+        .join(
+            blocks.select(F.col("f_root").alias("f_attestation_1_target_root"),
+                          F.col("f_slot").alias("tgt_1_slot"), 
+                          F.col("f_parent_root").alias("tgt_1_parent_root")
+                         ), 
+            on = "f_attestation_1_target_root"
+        )
+        #... slot # for the source of second attestation ...
+        .join(
+            blocks.select(F.col("f_root").alias("f_attestation_2_source_root"),
+                          F.col("f_slot").alias("src_2_slot"), 
+                          F.col("f_parent_root").alias("src_2_parent_root")
+                         ), 
+            on = "f_attestation_2_source_root"
+        )
+        #... slot # for the target of second attestation ...
+        .join(
+            blocks.select(F.col("f_root").alias("f_attestation_2_target_root"),
+                          F.col("f_slot").alias("tgt_2_slot"), 
+                          F.col("f_parent_root").alias("tgt_2_parent_root")
+                         ), 
+            on = "f_attestation_2_target_root"
+        )
+        # ... and the indices of the slashed validators.
+        .withColumn("slashed_validators", F.array_intersect('f_attestation_1_indices', 'f_attestation_2_indices'))
+    )
+```
+
+Lets convert to pandas land and see what it looks like real quick...
+
+```{python}
+# into pandas land
+sb_df = slashings_blocks.toPandas() 
+
+sb_df[['src_1_slot', 'tgt_1_slot', 'src_2_slot', 'tgt_2_slot', 'slashed_validators']].head(100)
+```
+...You can see most have only a single offender, though there are some with multiple.
+
+To plot the slashing activity, I need to include slots that did not have any slashing activity, so I join the dataframe to a single column dataframe containing all slot numbers, I also computing a rolling average of slashings across 500 slots to smooth out the plot.
+
+*The Roughtime Event*
+
+The medalla chain went through a bit of a rough patch described [here](https://medium.com/prysmatic-labs/eth2-medalla-testnet-incident-f7fbc3cc934a).  As such it seems useful to separate out the data from the slots corresponding to this event.  I eyeball it and choose slots 100000 to 150000 to separate out.
+
+```{python}
+# number of validators slashed for a given bad pair of attestations
+sb_df['n_slashed_validators'] = sb_df['slashed_validators'].apply(len)
+
+# total number of slashed validators per slot
+join_df = sb_df.groupby(['f_inclusion_slot'], as_index = False).agg({"n_slashed_validators":"sum"})
+
+# join to create zero rows for slots with no slashings
+slot_df = pd.DataFrame({"slot":range(sb_df.f_inclusion_slot.max())})
+slashing_activity = pd.merge(slot_df, join_df, left_on="slot", right_on = "f_inclusion_slot", how="left").fillna(0)
+
+# create a rolling average and downsample for a more descriptive plot
+slashing_activity['avgslashings'] = slashing_activity.rolling(500)['n_slashed_validators'].mean()
+slashing_activity_ds = slashing_activity.iloc[::5,:]
+```
+```{python, fig.show=FALSE}
+# plot the roughtime event separately
+roughtime_df = slashing_activity_ds.query("slot > 100000 & slot < 150000")
+normal_df = slashing_activity_ds.query("slot < 100000 | slot > 150000")
+
+fig = go.Figure(
+        [go.Scatter(x = roughtime_df['slot'], 
+                    y = roughtime_df['avgslashings'], 
+                    mode = 'lines', line = {'color':"red"}, name = "Roughtime event"),
+        go.Scatter(x = normal_df['slot'], 
+                   y = normal_df['avgslashings'], 
+                   mode = 'lines', line = {'color':"blue"}, name = "Normal operation")],
+    layout = go.Layout(xaxis_title="Slot", yaxis_title="Average slashings over 500 slots")
+)
+import chart_studio.plotly as py
+
+pio.write_html(fig, file='./html_plots/average_slashings.html', auto_open=False)
+```
+
+
+
+```{r}
+htmltools::includeHTML('./html_plots/average_slashings.html')
+```
+
+
+```{python}
+# differences in source and target between two attestations
+sb_df['diff_src'] = sb_df['src_1_slot'] - sb_df['src_2_slot']
+sb_df['diff_tgt'] = sb_df['tgt_1_slot'] - sb_df['tgt_2_slot']
+
+sb_df['size'] = sb_df.groupby(['diff_src', 'diff_tgt'])['src_1_slot'].transform("size")
+sb_df['nslashed_by_dist'] = sb_df.groupby(['diff_src', 'diff_tgt'])['n_slashed_validators'].transform("sum")
+
+sb_df['n_attestations_1'] = sb_df['f_attestation_1_indices'].apply(len)
+sb_df['n_attestations_2'] = sb_df['f_attestation_2_indices'].apply(len)
+
+sb_df['nslashed_by_natts'] = sb_df.groupby(['n_attestations_1', 'n_attestations_2'])['n_slashed_validators'].transform("sum")
+
+df_roughtime = sb_df.query("f_inclusion_slot > 100000 & f_inclusion_slot < 150000")
+df_normal = sb_df.query("f_inclusion_slot < 100000 | f_inclusion_slot > 150000")
+```
+
+```{python}
+
+```
+
+
+```{python}
+plot_df_roughtime = df_roughtime.groupby(['diff_src', 'diff_tgt'], as_index = False).agg('n_slashed_validators').sum()
+plot_df_normal = df_normal.groupby(['diff_src', 'diff_tgt'], as_index = False).agg('n_slashed_validators').sum()
+```
+
+```{python}
+fig = go.Figure(
+    [go.Scatter(x=plot_df_normal['diff_src'], y=plot_df_normal['diff_tgt'], mode = 'markers',
+              marker = dict(size=np.log2(plot_df_normal['n_slashed_validators'])/np.log2(1.5)+10),
+              hovertemplate =
+                '<b>diff src</b>: %{x}'+
+                '<br><b>diff_tgt</b>: %{y}<br>'+
+                '<b>Number of slashed pairs: %{text}</b>',
+              text = plot_df_normal['n_slashed_validators'],
+              name = "Normal Operation",
+              showlegend=True),
+    go.Scatter(x=plot_df_roughtime['diff_src'], y=plot_df_roughtime['diff_tgt'], mode = 'markers',
+              marker = dict(size=np.log2(plot_df_roughtime['n_slashed_validators'])/np.log2(1.5)+10),
+              hovertemplate =
+                '<b>diff src</b>: %{x}'+
+                '<br><b>diff_tgt</b>: %{y}<br>'+
+                '<b>Number of slashed pairs: %{text}</b>',
+              text = plot_df_roughtime['n_slashed_validators'],
+              name = "Roughtime",
+              showlegend=True)],
+    go.Layout(
+        xaxis_title = "Slot distance between sources",
+        yaxis_title = "Slot distance between targets",
+        title = {"text":"Source and target slot distances for pairs of attestations resulting in one or more slashings",
+                "y":0.85, "xanchor":"center", "x":0.5},
+        legend={"orientation":"h", "yanchor":"top", "y":0.99, "x":0.005}
+    )
+)
+pio.write_html(fig, file='./html_plots/slashing_distances.html', auto_open=False)
+```
+
+```{r}
+htmltools::includeHTML('./html_plots/slashing_distances.html')
+```
+
+```{python}
+fig = go.Figure()
+
+fig.add_trace(
+    go.Scatter(x=df_normal['n_attestations_1'], y=df_normal['n_attestations_2'], 
+               mode='markers',
+               marker=dict(color=np.log2(df_normal['nslashed_by_natts'])),
+               text=df_normal['nslashed_by_natts'],
+               name = "Normal Operation")
+)
+
+fig.add_trace(
+    go.Scatter(x=df_roughtime['n_attestations_1'], y=df_roughtime['n_attestations_2'], 
+               mode='markers',
+               marker=dict(color="red"),
+               text=df_roughtime['nslashed_by_natts'],
+               name = "Roughtime")
+)
+
+fig.update_layout(
+    autosize=False,
+    width=900,
+    height=900,
+    xaxis_title="Number of other validators making the same attestation 1",
+    yaxis_title="Number of other validators making the same attestations 2",
+    title = {"text":"For a pair of attestations resulting in a slashing, <br>how many other validators made the same attestation as the first and/or second attestation?", "y":0.92, "xanchor":"left", "x":0.1}
+)
+
+#fig.show()
+pio.write_html(fig, file='./html_plots/voting_group_sizes.html', auto_open=False)
+```
+```{r}
+htmltools::includeHTML('./html_plots/voting_group_sizes.html')
+```
+
+***
+
+#### References
