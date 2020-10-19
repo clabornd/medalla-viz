@@ -1,0 +1,13 @@
+#R
+reticulate==1.16
+shiny==1.5.0
+dplyr==1.0.2
+rmarkdown==2.4
+knitr==1.30
+DT==0.16
+
+#Python
+pandas==1.1.2
+numpy==1.19.2
+plotly==4.10.0
+pyspark==3.0.1
